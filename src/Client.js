@@ -6,7 +6,7 @@ const moduleRaid = require('@pedroslopez/moduleraid/moduleraid');
 
 const Util = require('./util/Util');
 const InterfaceController = require('./util/InterfaceController');
-const { WhatsWebURL, DefaultOptions, Events, WAState } = require('./util/Constants');
+const { WhatsWebURL, DefaultOptions, Events, WAState, MessageTypes } = require('./util/Constants');
 const { ExposeAuthStore } = require('./util/Injected/AuthStore/AuthStore');
 const { ExposeStore } = require('./util/Injected/Store');
 const { ExposeLegacyAuthStore } = require('./util/Injected/AuthStore/LegacyAuthStore');
@@ -27,6 +27,7 @@ const {exposeFunctionIfAbsent} = require('./util/Puppeteer');
  * @param {string} options.webVersion - The version of WhatsApp Web to use. Use options.webVersionCache to configure how the version is retrieved.
  * @param {object} options.webVersionCache - Determines how to retrieve the WhatsApp Web version. Defaults to a local cache (LocalWebCache) that falls back to latest if the requested version is not found.
  * @param {number} options.authTimeoutMs - Timeout for authentication selector in puppeteer
+ * @param {function} options.evalOnNewDoc - function to eval on new doc
  * @param {object} options.puppeteer - Puppeteer launch options. View docs here: https://github.com/puppeteer/puppeteer/
  * @param {number} options.qrMaxRetries - How many times should the qrcode be refreshed before giving up
  * @param {string} options.restartOnAuthFail  - @deprecated This option should be set directly on the LegacySessionAuth.
@@ -95,7 +96,20 @@ class Client extends EventEmitter {
      * Private function
      */
     async inject() {
-        await this.pupPage.waitForFunction('window.Debug?.VERSION != undefined', {timeout: this.options.authTimeoutMs});
+        if(this.options.authTimeoutMs === undefined || this.options.authTimeoutMs==0){
+            this.options.authTimeoutMs = 30000;
+        }
+        let start = Date.now();
+        let timeout = this.options.authTimeoutMs;
+        let res = false;
+        while(start > (Date.now() - timeout)){
+            res = await this.pupPage.evaluate('window.Debug?.VERSION != undefined');
+            if(res){break;}
+            await new Promise(r => setTimeout(r, 200));
+        }
+        if(!res){ 
+            throw 'auth timeout';
+        }       
         await this.setDeviceName(this.options.deviceName, this.options.browserName);
         const pairWithPhoneNumber = this.options.pairWithPhoneNumber;
         const version = await this.getWWebVersion();
@@ -225,9 +239,17 @@ class Client extends EventEmitter {
                     await new Promise(r => setTimeout(r, 2000)); 
                     await this.pupPage.evaluate(ExposeLegacyStore);
                 }
-
-                // Check window.Store Injection
-                await this.pupPage.waitForFunction('window.Store != undefined');
+                let start = Date.now();
+                let res = false;
+                while(start > (Date.now() - 30000)){
+                    // Check window.Store Injection
+                    res = await this.pupPage.evaluate('window.Store != undefined');
+                    if(res){break;}
+                    await new Promise(r => setTimeout(r, 200));
+                }
+                if(!res){
+                    throw 'ready timeout';
+                }
             
                 /**
                      * Current connection information
@@ -300,7 +322,7 @@ class Client extends EventEmitter {
             page = await browser.newPage();
         } else {
             const browserArgs = [...(puppeteerOpts.args || [])];
-            if(!browserArgs.find(arg => arg.includes('--user-agent'))) {
+            if(this.options.userAgent !== false && !browserArgs.find(arg => arg.includes('--user-agent'))) {
                 browserArgs.push(`--user-agent=${this.options.userAgent}`);
             }
             // navigator.webdriver fix
@@ -313,8 +335,9 @@ class Client extends EventEmitter {
         if (this.options.proxyAuthentication !== undefined) {
             await page.authenticate(this.options.proxyAuthentication);
         }
-      
-        await page.setUserAgent(this.options.userAgent);
+        if(this.options.userAgent !== false) {
+            await page.setUserAgent(this.options.userAgent);
+        }
         if (this.options.bypassCSP) await page.setBypassCSP(true);
 
         this.pupBrowser = browser;
@@ -322,7 +345,11 @@ class Client extends EventEmitter {
 
         await this.authStrategy.afterBrowserInitialized();
         await this.initWebVersionCache();
-
+        
+        if (this.options.evalOnNewDoc !== undefined) {
+            await page.evaluateOnNewDocument(this.options.evalOnNewDoc);
+        }
+        
         // ocVersion (isOfficialClient patch)
         // remove after 2.3000.x hard release
         await page.evaluateOnNewDocument(() => {
@@ -948,15 +975,26 @@ class Client extends EventEmitter {
      */
     async sendMessage(chatId, content, options = {}) {
         const isChannel = /@\w*newsletter\b/.test(chatId);
+        const isStatus = /@\w*broadcast\b/.test(chatId);
 
         if (isChannel && [
-            options.sendMediaAsDocument, options.quotedMessageId, 
+            options.sendMediaAsDocument, options.quotedMessageId,
             options.parseVCards, options.isViewOnce,
             content instanceof Location, content instanceof Contact,
             content instanceof Buttons, content instanceof List,
             Array.isArray(content) && content.length > 0 && content[0] instanceof Contact
         ].includes(true)) {
             console.warn('The message type is currently not supported for sending in channels,\nthe supported message types are: text, image, sticker, gif, video, voice and poll.');
+            return null;
+
+        } else if (isStatus && [
+            options.sendMediaAsDocument, options.quotedMessageId,
+            options.parseVCards, options.isViewOnce, options.sendMediaAsSticker,
+            content instanceof Location, content instanceof Contact,
+            content instanceof Poll, content instanceof Buttons, content instanceof List,
+            Array.isArray(content) && content.length > 0 && content[0] instanceof Contact
+        ].includes(true)) {
+            console.warn('The message type is currently not supported for sending in status broadcast,\nthe supported message types are: text, image, gif, audio and video.');
             return null;
         }
     
@@ -1193,7 +1231,12 @@ class Client extends EventEmitter {
 
         return ContactFactory.create(this, contact);
     }
-    
+
+    /**
+     * Get message by ID
+     * @param {string} messageId
+     * @returns {Promise<Message>}
+     */
     async getMessageById(messageId) {
         const msg = await this.pupPage.evaluate(async messageId => {
             let msg = window.Store.Msg.get(messageId);
@@ -1225,11 +1268,18 @@ class Client extends EventEmitter {
             
             const msgs = await window.Store.PinnedMsgUtils.getTable().equals(['chatId'], chatWid.toString());
 
-            const pinnedMsgs = msgs.map((msg) => window.Store.Msg.get(msg.parentMsgKey));
+            const pinnedMsgs = (
+                await Promise.all(
+                    msgs.filter(msg => msg.pinType == 1).map(async (msg) => {
+                        const res = await window.Store.Msg.getMessagesById([msg.parentMsgKey]);
+                        return res?.messages?.[0];
+                    })
+                )
+            ).filter(Boolean);
 
             return !pinnedMsgs.length
                 ? []
-                : pinnedMsgs.map((msg) => window.WWebJS.getMessageModel(msg));
+                : await Promise.all(pinnedMsgs.map((msg) => window.WWebJS.getMessageModel(msg)));
         }, chatId);
 
         return pinnedMsgs.map((msg) => new Message(this, msg));
@@ -1524,7 +1574,7 @@ class Client extends EventEmitter {
         const commonGroups = await this.pupPage.evaluate(async (contactId) => {
             let contact = window.Store.Contact.get(contactId);
             if (!contact) {
-                const wid = window.Store.WidFactory.createUserWid(contactId);
+                const wid = window.Store.WidFactory.createWid(contactId);
                 const chatConstructor = window.Store.Contact.getModelsArray().find(c=>!c.isGroup).constructor;
                 contact = new chatConstructor({id: wid});
             }
@@ -1963,7 +2013,7 @@ class Client extends EventEmitter {
 
         return labels.map(data => new Label(this, data));
     }
-    
+
     /**
      * Get all current Broadcast
      * @returns {Promise<Array<Broadcast>>}
@@ -1973,6 +2023,49 @@ class Client extends EventEmitter {
             return window.WWebJS.getAllStatuses();
         });
         return broadcasts.map(data => new Broadcast(this, data));
+    }
+
+    /**
+     * Get broadcast instance by current user ID
+     * @param {string} contactId
+     * @returns {Promise<Broadcast>}
+     */
+    async getBroadcastById(contactId) {
+        const broadcast = await this.pupPage.evaluate(async (userId) => {
+            let status;
+            try {
+                status = window.Store.Status.get(userId);
+                if (!status) {
+                    status = await window.Store.Status.find(userId);
+                }
+            } catch {
+                status = null;
+            }
+
+            if (status) return window.WWebJS.getStatusModel(status);
+        }, contactId);
+        return new Broadcast(this, broadcast);
+    }
+
+    /**
+     * Revoke current own status messages
+     * @param {string} messageId
+     * @returns {Promise<void>}
+     */
+    async revokeStatusMessage(messageId) {
+        return await this.pupPage.evaluate(async (msgId) => {
+            const status = window.Store.Status.getMyStatus();
+            if (!status) return;
+
+            const msg =
+                window.Store.Msg.get(msgId) || (await window.Store.Msg.getMessagesById([msgId]))?.messages?.[0];
+            if (!msg) return;
+
+            if (!msg.id.fromMe || !msg.id.remote.isStatus())
+                throw 'Invalid usage! Can only revoke the message its from own status broadcast';
+
+            return await window.Store.StatusUtils.sendStatusRevokeMsgAction(status, msg);
+        }, messageId);
     }
 
     /**
@@ -2310,13 +2403,15 @@ class Client extends EventEmitter {
      * @param {string} firstName 
      * @param {string} lastName 
      * @param {boolean} [syncToAddressbook = false] If set to true, the contact will also be saved to the user's address book on their phone. False by default
-     * @returns {Promise<import('..').ChatId>} Object in a wid format
+     * @returns {Promise<void>}
      */
     async saveOrEditAddressbookContact(phoneNumber, firstName, lastName, syncToAddressbook = false)
     {
         return await this.pupPage.evaluate(async (phoneNumber, firstName, lastName, syncToAddressbook) => {
             return await window.Store.AddressbookContactUtils.saveContactAction(
                 phoneNumber,
+                phoneNumber,
+                null,
                 null,
                 firstName,
                 lastName,
@@ -2343,20 +2438,95 @@ class Client extends EventEmitter {
      * @returns {Promise<Array<{ lid: string, pn: string }>>}
      */
     async getContactLidAndPhone(userIds) {
-        return await this.pupPage.evaluate((userIds) => {
-            !Array.isArray(userIds) && (userIds = [userIds]);
-            return userIds.map(userId => {
-                const wid = window.Store.WidFactory.createWid(userId);
-                const isLid = wid.server === 'lid';
-                const lid = isLid ? wid : window.Store.LidUtils.getCurrentLid(wid);
-                const phone = isLid ? window.Store.LidUtils.getPhoneNumber(wid) : wid;
+        return await this.pupPage.evaluate(async (userIds) => {
+            if (!Array.isArray(userIds)) userIds = [userIds];
+
+            return await Promise.all(userIds.map(async (userId) => {
+                const { lid, phone } = await window.WWebJS.enforceLidAndPnRetrieval(userId);
 
                 return {
-                    lid: lid._serialized,
-                    pn: phone._serialized
+                    lid: lid?._serialized,
+                    pn: phone?._serialized
+                };
+            }));
+        }, userIds);
+    }
+
+    /**
+     * Add or edit a customer note
+     * @see https://faq.whatsapp.com/1433099287594476
+     * @param {string} userId The ID of a customer to add a note to
+     * @param {string} note The note to add
+     * @returns {Promise<void>}
+     */
+    async addOrEditCustomerNote(userId, note) {
+        return await this.pupPage.evaluate(async (userId, note) => {
+            if (!window.Store.BusinessGatingUtils.smbNotesV1Enabled()) return;
+
+            return window.Store.CustomerNoteUtils.noteAddAction(
+                'unstructured',
+                window.Store.WidToJid.widToUserJid(window.Store.WidFactory.createWid(userId)),
+                note
+            );
+        }, userId, note);
+    }
+
+    /**
+     * Get a customer note
+     * @see https://faq.whatsapp.com/1433099287594476
+     * @param {string} userId The ID of a customer to get a note from
+     * @returns {Promise<{
+     *    chatId: string,
+     *    content: string,
+     *    createdAt: number,
+     *    id: string,
+     *    modifiedAt: number,
+     *    type: string
+     * }>}
+     */
+    async getCustomerNote(userId) {
+        return await this.pupPage.evaluate(async (userId) => {
+            if (!window.Store.BusinessGatingUtils.smbNotesV1Enabled()) return null;
+
+            const note = await window.Store.CustomerNoteUtils.retrieveOnlyNoteForChatJid(
+                window.Store.WidToJid.widToUserJid(window.Store.WidFactory.createWid(userId))
+            );
+
+            let serialized = note?.serialize();
+
+            if (!serialized) return null;
+
+            serialized.chatId = window.Store.JidToWid.userJidToUserWid(serialized.chatJid)._serialized;
+            delete serialized.chatJid;
+
+            return serialized;
+        }, userId);
+    }
+    
+    /**
+     * Get Poll Votes
+     * @param {string} messageId
+     * @return {Promise<Array<PollVote>>} 
+     */
+    async getPollVotes(messageId) {
+        const msg = await this.getMessageById(messageId);
+        if (!msg) return [];
+        if (msg.type != MessageTypes.POLL_CREATION) throw 'Invalid usage! Can only be used with a pollCreation message';
+
+        const pollVotes = await this.pupPage.evaluate( async (msg) => {
+            const msgKey = window.Store.MsgKey.fromString(msg.id._serialized);
+            let pollVotes = await window.Store.PollsVotesSchema.getTable().equals(['parentMsgKey'], msgKey.toString());
+            
+            return pollVotes.map(item => {
+                const typedArray = new Uint8Array(item.selectedOptionLocalIds);
+                return {
+                    ...item,
+                    selectedOptionLocalIds: Array.from(typedArray)
                 };
             });
-        }, userIds);
+        }, msg);
+
+        return pollVotes.map((pollVote) => new PollVote(this.client, {...pollVote, parentMessage: msg}));
     }
 }
 
